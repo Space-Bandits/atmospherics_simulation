@@ -2,12 +2,12 @@ use thiserror::Error;
 
 /// Properties for a type of fluid.
 pub struct FluidProperties {
-    pub fluid_type: FluidPropertiesType,
+    pub fluid_type: FluidTypeProperties,
     /// Joules per mol per kelvin
     pub heat_capactity: f32,
 }
 
-pub enum FluidPropertiesType {
+pub enum FluidTypeProperties {
     Liquid(LiquidFluidProperties),
     Gas(GasFluidProperties),
 }
@@ -29,6 +29,14 @@ pub struct GasFluidProperties {}
 #[derive(Default)]
 pub struct FluidCollection {
     fluids: Vec<FluidProperties>,
+}
+
+impl FromIterator<FluidProperties> for FluidCollection {
+    fn from_iter<T: IntoIterator<Item = FluidProperties>>(iter: T) -> Self {
+        FluidCollection {
+            fluids: iter.into_iter().collect(),
+        }
+    }
 }
 
 impl FluidCollection {
