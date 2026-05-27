@@ -5,13 +5,13 @@ use crate::{
 };
 
 pub struct FluidVolume {
-    mixture: Mixture,
+    pub mixture: Mixture,
     /// Litres
-    volume: f32,
+    pub volume: f32,
 }
 
 /// The properties of a [FluidVolume] that are derived from its makeup.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ComputedVolumeProperties {
     pub mixture_properties: ComputedMixtureProperties,
     /// kPa
@@ -46,5 +46,9 @@ impl FluidVolume {
             mixture_properties,
             pressure,
         })
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
     }
 }

@@ -1,4 +1,6 @@
-use crate::fluid_properties::{FluidCollection, FluidTypeProperties, InvalidFluidId};
+use crate::fluid_properties::{
+    FluidCollection, FluidProperties, FluidTypeProperties, InvalidFluidId,
+};
 
 /// An amount of a specific fluid.
 #[derive(Clone, Copy, Debug)]
@@ -17,7 +19,7 @@ pub struct Mixture {
 }
 
 /// The properties of a [Mixture] that are derived from its makeup.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ComputedMixtureProperties {
     /// Joules per Kelvin
     pub heat_capacity: f32,
@@ -48,7 +50,7 @@ impl Mixture {
     ) -> Result<(), InvalidFluidId> {
         let properties = collection.get_properties(fluid.fluid_id)?;
 
-        self.energy += fluid.moles * properties.heat_capactity * temperature;
+        self.energy += fluid.moles * properties.molar_heat_capactity * temperature;
 
         self.add_fluid(fluid);
 
@@ -71,8 +73,40 @@ impl Mixture {
     }
 
     pub fn add_mixture(&mut self, mixture: Self) {
+        // Merge the two sorted lists of fluids together, combine duplicate entries.
+
+        let mut probe_index = 0;
+
         for fluid in mixture.fluids {
-            self.add_fluid(fluid);
+            loop {
+                if let Some(probed_fluid) = self.fluids.get_mut(probe_index) {
+                    match fluid.fluid_id.cmp(&probed_fluid.fluid_id) {
+                        std::cmp::Ordering::Less => {
+                            // If the id of the added fluid is before the probed fluid insert and shift up at the probe.
+                            self.fluids.insert(probe_index, fluid);
+                            // Shift probe up after insert
+                            probe_index += 1;
+                            break;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            probed_fluid.moles += fluid.moles;
+                            // There won't be two of the same fluid so shift probe up.
+                            probe_index += 1;
+                            break;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            // This fluid should be inserted after the probed fluid, shift the probe and check next.
+                            probe_index += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                self.fluids.push(fluid);
+                // Shift probe up after insert
+                probe_index += 1;
+                break;
+            }
         }
     }
 
@@ -99,7 +133,7 @@ impl Mixture {
         for fluid in &self.fluids {
             let properties = collection.get_properties(fluid.fluid_id)?;
 
-            heat_capacity += properties.heat_capactity * fluid.moles;
+            heat_capacity += properties.molar_heat_capactity * fluid.moles;
 
             match properties.fluid_type {
                 FluidTypeProperties::Liquid(ref liquid_properties) => {
@@ -119,5 +153,48 @@ impl Mixture {
             gas_moles,
             temperature,
         })
+    }
+
+    /// Selectively extracts fluids and energy from the mixture.
+    ///
+    /// If an error is returned the mixture may still have had some fluids removed.
+    pub fn extract_fluids(
+        &mut self,
+        collection: &FluidCollection,
+        mut predicate: impl FnMut(&Fluid, &FluidProperties) -> f32,
+    ) -> Result<Self, InvalidFluidId> {
+        let mut mixture = Mixture::default();
+
+        // Joules per Kelvin
+        let mut heat_capacity_kept = 0.;
+        let mut heat_capacity_extracted = 0.;
+
+        for fluid in &mut self.fluids {
+            let fluid_properties = collection.get_properties(fluid.fluid_id)?;
+
+            let extract_moles = predicate(fluid, fluid_properties).min(fluid.moles);
+
+            if extract_moles <= 0. {
+                continue;
+            }
+
+            fluid.moles -= extract_moles;
+
+            // Ordering is retained
+            mixture.fluids.push(Fluid {
+                fluid_id: fluid.fluid_id,
+                moles: extract_moles,
+            });
+
+            heat_capacity_kept += fluid_properties.molar_heat_capactity * fluid.moles;
+            heat_capacity_extracted += fluid_properties.molar_heat_capactity * extract_moles;
+        }
+
+        let heat_capacity = heat_capacity_kept + heat_capacity_extracted;
+
+        mixture.energy = self.energy * (heat_capacity_extracted / heat_capacity);
+        self.energy = self.energy * (heat_capacity_kept / heat_capacity);
+
+        Ok(mixture)
     }
 }

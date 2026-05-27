@@ -4,7 +4,7 @@ use thiserror::Error;
 pub struct FluidProperties {
     pub fluid_type: FluidTypeProperties,
     /// Joules per mol per kelvin
-    pub heat_capactity: f32,
+    pub molar_heat_capactity: f32,
 }
 
 pub enum FluidTypeProperties {
