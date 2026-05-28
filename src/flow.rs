@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::{
-    fluid_properties::{FluidCollection, FluidTypeProperties, InvalidFluidId},
+    fluid_properties::{FluidCollection, InvalidFluidId},
     fluid_volume::{ComputedVolumeProperties, FluidVolume},
     mixture::Mixture,
 };
@@ -11,8 +11,7 @@ use crate::{
 pub struct FlowSimulationState<K> {
     volumes: Vec<K>,
     volume_states: HashMap<K, FlowVolumeNodeSimulationState>,
-    liquid_edges: Vec<LiquidEdgeState>,
-    gas_edges: Vec<GasEdgeState>,
+    edges: Vec<FlowEdgeState>,
 }
 
 #[derive(Default)]
@@ -20,34 +19,25 @@ struct FlowVolumeNodeSimulationState {
     volume: f32,
     computed_properties: ComputedVolumeProperties,
 
-    /// Indices of edges sending liquid from this volume.
-    send_liquid_edges: Vec<usize>,
-    /// Indices of edges sending liquid from to volume.
-    receive_liquid_edges: Vec<usize>,
-    /// The maximum volume of liquid that an edge would remove from this volume independently.
-    send_max_volume: f32,
-    /// The maximum volume of liquid that an edge would add to this volume independently.
-    receive_max_volume: f32,
-
-    /// Indices of edges sending gas from this volume.
-    send_gas_edges: Vec<usize>,
-    /// Indices of edges sending gas from to volume.
-    receive_gas_edges: Vec<usize>,
-    /// The maximum pressure volumes of gas that an edge would remove from this volume independently.
-    send_max_pv: f32,
-    /// The maximum pressure volumes of gas that an edge would add to this volume independently.
-    receive_max_pv: f32,
+    /// Indices of edges sending fluid from this volume.
+    send_edges: Vec<usize>,
+    /// Indices of edges sending fluid from to volume.
+    receive_edges: Vec<usize>,
 }
 
-struct LiquidEdgeState {
-    move_volume: f32,
-    limited_move_volume: f32,
-    extracted_mixture: Mixture,
-}
-
-struct GasEdgeState {
-    move_pv: f32,
-    limited_move_pv: f32,
+struct FlowEdgeState {
+    /// How much liquid to move, used to calculate the `limited_move_ratio`
+    move_liquid_volume: f32,
+    /// How much gas to move, used to calculate the `limited_move_ratio`
+    move_gas_work: f32,
+    /// What pressure this edge would leave its "from" side at.
+    from_pressure: f32,
+    /// What pressure this edge would leave its "to" side at.
+    to_pressure: f32,
+    /// What proportion of the source volume is considered 100% after limiting.
+    move_ratio: f32,
+    /// What ratio of this edge will get moved after it has been limited by its send and receive side.
+    limited_move_ratio: f32,
     extracted_mixture: Mixture,
 }
 
@@ -56,15 +46,10 @@ struct GasEdgeState {
 /// - `K` is the key that indentifies a volume.
 /// - `E` is an error type that gets bubbled up through [FlowSimulationState::step] if any of the methods fail.
 pub trait SimulationQueries<K, E> {
-    /// Should return an iterator of all other edges that liquid can flow into from a volume.
+    /// Should return an iterator of all other edges that fluid can flow into from a volume.
     ///
     /// Should always return the exact same edges in the same order for any volume within one simulation step.
-    fn get_liquid_edges(&self, volume_id: &K) -> Result<impl IntoIterator<Item = K>, E>;
-
-    /// Should return an iterator of all other edges that gas can flow into from a volume.
-    ///
-    /// Should always return the exact same edges in the same order for any volume within one simulation step.
-    fn get_gas_edges(&self, volume_id: &K) -> Result<impl IntoIterator<Item = K>, E>;
+    fn get_edges(&self, volume_id: &K) -> Result<impl IntoIterator<Item = K>, E>;
 
     fn get_volume(&self, volume_id: &K) -> Result<&FluidVolume, E>;
 
@@ -76,8 +61,7 @@ impl<K> Default for FlowSimulationState<K> {
         FlowSimulationState {
             volumes: Vec::new(),
             volume_states: HashMap::new(),
-            liquid_edges: Vec::new(),
-            gas_edges: Vec::new(),
+            edges: Vec::new(),
         }
     }
 }
@@ -98,18 +82,7 @@ where
         collection: &FluidCollection,
         queries: &mut impl SimulationQueries<K, E>,
     ) -> Result<(), FlowSimulationError<K, E>> {
-        // Flow is limited using this process for both outgoing and incomming liquid and gas:
-        //
-        // Find the sum of all fluid flow into/out of a volume, as well as the maximum inward and outward flow.
-        // Scale all edge flows uniformly so that the flow into/out of the volume is the maximum.
-        //
-        // This stops situations where multiple edges compounding on each other try to overfill or overdrain a volume because they don't consider the whole graph.
-        //
-        // Liquid flow is calculated first and displaces any gas in its way, which is calculated at a second priority after.
-        // This means that gas cannot be pushed around by liquids
-
-        self.liquid_edges.clear();
-        self.gas_edges.clear();
+        self.edges.clear();
 
         // Get volumes, calculate derived properties and clear working values.
         for volume_id in &self.volumes {
@@ -122,41 +95,11 @@ where
             state.volume = volume.volume();
             state.computed_properties = volume.calculate_properties(collection)?;
 
-            state.send_liquid_edges.clear();
-            state.receive_liquid_edges.clear();
-            state.send_max_volume = 0.;
-            state.receive_max_volume = 0.;
-
-            state.send_gas_edges.clear();
-            state.receive_gas_edges.clear();
-            state.send_max_pv = 0.;
-            state.receive_max_pv = 0.;
+            state.send_edges.clear();
+            state.receive_edges.clear();
         }
 
-        self.step_liquid(collection, queries)?;
-
-        // Recalculate derived values after moving liquids
-        for volume_id in &self.volumes {
-            let volume = queries
-                .get_volume(volume_id)
-                .map_err(|err| FlowQueryError(err))?;
-
-            let state = self.volume_states.get_mut(volume_id).unwrap();
-
-            state.computed_properties = volume.calculate_properties(collection)?;
-        }
-
-        self.step_gas(collection, queries)?;
-
-        Ok(())
-    }
-
-    fn step_liquid<E>(
-        &mut self,
-        collection: &FluidCollection,
-        queries: &mut impl SimulationQueries<K, E>,
-    ) -> Result<(), FlowSimulationError<K, E>> {
-        // Pass over all edges and determine what amount of liquid each of them would move in isolation
+        // Pass over all edges and determine what amount of fluid each of them would move in isolation to equalize its two connected volumes.
         for volume_id in &self.volumes {
             let &FlowVolumeNodeSimulationState {
                 volume,
@@ -164,8 +107,13 @@ where
                 ..
             } = self.volume_states.get(volume_id).unwrap();
 
+            if computed_properties.pressure <= 0. {
+                // Zero gas pressure means no flow, skip to avoid divisions by zero.
+                continue;
+            }
+
             for other_volume_id in queries
-                .get_liquid_edges(volume_id)
+                .get_edges(volume_id)
                 .map_err(|err| FlowQueryError(err))?
             {
                 let &FlowVolumeNodeSimulationState {
@@ -177,71 +125,136 @@ where
                     .get(&other_volume_id)
                     .ok_or(FlowSimulationError::InvalidVolumeId(other_volume_id))?;
 
-                // What volume of liquid needs to be moved into the other tank in order to equalize the fill levels
-                let move_volume = {
-                    let v1 = volume;
-                    let v2 = other_volume;
-                    let l1 = computed_properties.mixture_properties.liquid_volume;
-                    let l2 = other_computed_properties.mixture_properties.liquid_volume;
+                let gas_volume = volume - computed_properties.mixture_properties.liquid_volume;
+                let other_gas_volume =
+                    other_volume - other_computed_properties.mixture_properties.liquid_volume;
 
-                    (l1 * v2 - l2 * v1) / (v1 + v2)
+                // What ratio of fluid from this volume needs to be moved into the other volume to equalize pressures.
+                let move_ratio = {
+                    let vs = volume;
+                    let lt = other_computed_properties.mixture_properties.liquid_volume;
+                    let ps = computed_properties.pressure;
+                    let pt = other_computed_properties.pressure;
+
+                    ((ps - pt) * gas_volume * other_gas_volume)
+                        / ((ps * gas_volume * (other_gas_volume + vs))
+                            + (pt * lt * other_gas_volume))
                 };
 
-                if move_volume < 0. {
+                if move_ratio <= 0. || !move_ratio.is_finite() {
                     continue;
                 }
 
-                let edge_index = self.liquid_edges.len();
+                let move_liquid_volume =
+                    computed_properties.mixture_properties.liquid_volume * move_ratio;
+                let move_gas_work = computed_properties.pressure * gas_volume * move_ratio;
 
-                self.liquid_edges.push(LiquidEdgeState {
-                    move_volume,
-                    limited_move_volume: move_volume,
+                let equalized_pressure = (computed_properties.pressure * gas_volume
+                    - move_gas_work)
+                    / (gas_volume + move_liquid_volume);
+
+                println!(
+                    "Moving {} to get pressure {}",
+                    move_ratio, equalized_pressure
+                );
+                println!(
+                    "will move liquid {} and work {}",
+                    move_liquid_volume, move_gas_work
+                );
+
+                let edge_index = self.edges.len();
+
+                self.edges.push(FlowEdgeState {
+                    move_liquid_volume,
+                    move_gas_work,
+                    from_pressure: equalized_pressure,
+                    to_pressure: equalized_pressure,
+                    move_ratio,
+                    limited_move_ratio: 0., // Will be set later.
                     extracted_mixture: Mixture::default(),
                 });
 
                 let state = self.volume_states.get_mut(volume_id).unwrap();
-                state.send_liquid_edges.push(edge_index);
-                state.send_max_volume = state.send_max_volume.max(move_volume);
+                state.send_edges.push(edge_index);
 
                 let state = self.volume_states.get_mut(&other_volume_id).unwrap();
-                state.receive_liquid_edges.push(edge_index);
-                state.receive_max_volume = state.receive_max_volume.max(move_volume);
+                state.receive_edges.push(edge_index);
             }
         }
+
+        // Limit edges based on their send and receive side.
 
         for volume_id in &self.volumes {
             let state = self.volume_states.get(volume_id).unwrap();
 
-            let total_send_volume: f32 = state
-                .send_liquid_edges
-                .iter()
-                .map(|&edge_index| self.liquid_edges.get(edge_index).unwrap().move_volume)
-                .sum();
+            let existing_gas_work = state.computed_properties.pressure
+                * (state.volume - state.computed_properties.mixture_properties.liquid_volume);
 
-            let scale = state.send_max_volume / total_send_volume;
+            // Limit edges adding to this volume
 
-            if scale.is_finite() {
-                for &edge_index in &state.send_liquid_edges {
-                    let edge = self.liquid_edges.get_mut(edge_index).unwrap();
+            let (receive_liquid_volume, receive_gas_work, pressure_target) =
+                state.receive_edges.iter().fold(
+                    (0., 0., state.computed_properties.pressure),
+                    |(liquid, gas, max_pressure), &edge_index| {
+                        let edge = self.edges.get(edge_index).unwrap();
 
-                    edge.limited_move_volume = edge.move_volume * scale;
+                        (
+                            liquid + edge.move_liquid_volume,
+                            gas + edge.move_gas_work,
+                            edge.to_pressure.max(max_pressure),
+                        )
+                    },
+                );
+
+            // What proportion of all the edges do we use to reach to target pressure.
+            let move_ratio = (pressure_target
+                * (state.volume - state.computed_properties.mixture_properties.liquid_volume)
+                - existing_gas_work)
+                / (receive_gas_work + pressure_target * receive_liquid_volume);
+
+            for &edge_index in &state.receive_edges {
+                let edge = self.edges.get_mut(edge_index).unwrap();
+
+                if move_ratio.is_finite() {
+                    edge.limited_move_ratio = move_ratio;
+
+                    println!("Limiting ratio to {} from recv", move_ratio);
+                } else {
+                    edge.limited_move_ratio = 0.;
                 }
             }
 
-            let total_receive_volume: f32 = state
-                .receive_liquid_edges
-                .iter()
-                .map(|&edge_index| self.liquid_edges.get(edge_index).unwrap().move_volume)
-                .sum();
+            // Limit edges taking from this volume
 
-            let scale = state.receive_max_volume / total_receive_volume;
+            let (send_liquid_volume, send_gas_work, pressure_target) =
+                state.send_edges.iter().fold(
+                    (0., 0., state.computed_properties.pressure),
+                    |(liquid, gas, min_pressure), &edge_index| {
+                        let edge = self.edges.get(edge_index).unwrap();
 
-            if scale.is_finite() {
-                for &edge_index in &state.receive_liquid_edges {
-                    let edge = self.liquid_edges.get_mut(edge_index).unwrap();
+                        (
+                            liquid + edge.move_liquid_volume,
+                            gas + edge.move_gas_work,
+                            edge.from_pressure.min(min_pressure),
+                        )
+                    },
+                );
 
-                    edge.limited_move_volume =
-                        edge.limited_move_volume.min(edge.move_volume * scale);
+            // What proportion of all the edges do we use to reach to target pressure.
+            let move_ratio = -(pressure_target
+                * (state.volume - state.computed_properties.mixture_properties.liquid_volume)
+                - existing_gas_work)
+                / (send_gas_work + pressure_target * send_liquid_volume);
+
+            for &edge_index in &state.send_edges {
+                let edge = self.edges.get_mut(edge_index).unwrap();
+
+                if move_ratio.is_finite() {
+                    edge.limited_move_ratio = edge.limited_move_ratio.min(move_ratio);
+
+                    println!("Limiting ratio to {} from send", move_ratio);
+                } else {
+                    edge.limited_move_ratio = 0.;
                 }
             }
         }
@@ -255,19 +268,23 @@ where
                 .get_volume_mut(volume_id)
                 .map_err(|err| FlowQueryError(err))?;
 
-            for &edge_index in &state.send_liquid_edges {
-                let edge = self.liquid_edges.get_mut(edge_index).unwrap();
+            for &edge_index in &state.send_edges {
+                let edge = self.edges.get_mut(edge_index).unwrap();
+
+                println!("Extracting {}", edge.move_ratio * edge.limited_move_ratio);
 
                 edge.extracted_mixture =
-                    volume.mixture.extract_fluids(collection, |_, properties| {
-                        if let FluidTypeProperties::Liquid(liquid_properties) =
-                            &properties.fluid_type
-                        {
-                            edge.limited_move_volume / liquid_properties.density
-                        } else {
-                            0.
-                        }
+                    volume.mixture.extract_fluids(collection, |fluid, _| {
+                        fluid.moles * edge.move_ratio * edge.limited_move_ratio
                     })?;
+
+                dbg!(
+                    volume
+                        .calculate_properties(collection)
+                        .unwrap()
+                        .mixture_properties
+                        .temperature
+                );
             }
         }
 
@@ -280,156 +297,14 @@ where
                 .get_volume_mut(volume_id)
                 .map_err(|err| FlowQueryError(err))?;
 
-            for &edge_index in &state.receive_liquid_edges {
-                let edge = self.liquid_edges.get_mut(edge_index).unwrap();
+            for &edge_index in &state.receive_edges {
+                let edge = self.edges.get_mut(edge_index).unwrap();
 
                 volume
                     .mixture
                     .add_mixture(std::mem::take(&mut edge.extracted_mixture));
             }
         }
-
-        Ok(())
-    }
-
-    fn step_gas<E>(
-        &mut self,
-        collection: &FluidCollection,
-        queries: &mut impl SimulationQueries<K, E>,
-    ) -> Result<(), FlowSimulationError<K, E>> {
-        // Pass over all edges and determine what amount of gas each of them would move in isolation
-        for volume_id in &self.volumes {
-            let &FlowVolumeNodeSimulationState {
-                volume,
-                computed_properties,
-                ..
-            } = self.volume_states.get(volume_id).unwrap();
-
-            for other_volume_id in queries
-                .get_liquid_edges(volume_id)
-                .map_err(|err| FlowQueryError(err))?
-            {
-                let &FlowVolumeNodeSimulationState {
-                    volume: other_volume,
-                    computed_properties: other_computed_properties,
-                    ..
-                } = self
-                    .volume_states
-                    .get(&other_volume_id)
-                    .ok_or(FlowSimulationError::InvalidVolumeId(other_volume_id))?;
-
-                // What volume of liquid needs to be moved into the other tank in order to equalize the fill levels
-                let move_pv = {
-                    let v1 = volume - computed_properties.mixture_properties.liquid_volume;
-                    let v2 =
-                        other_volume - other_computed_properties.mixture_properties.liquid_volume;
-                    let p1 = computed_properties.pressure;
-                    let p2 = other_computed_properties.pressure;
-
-                    (p1 * v2 - p2 * v1) / (v1 + v2)
-                };
-
-                if move_pv < 0. {
-                    continue;
-                }
-
-                let edge_index = self.gas_edges.len();
-
-                self.gas_edges.push(GasEdgeState {
-                    move_pv,
-                    limited_move_pv: move_pv,
-                    extracted_mixture: Mixture::default(),
-                });
-
-                let state = self.volume_states.get_mut(volume_id).unwrap();
-                state.send_gas_edges.push(edge_index);
-                state.send_max_volume = state.send_max_volume.max(move_pv);
-
-                let state = self.volume_states.get_mut(&other_volume_id).unwrap();
-                state.receive_gas_edges.push(edge_index);
-                state.receive_max_volume = state.receive_max_volume.max(move_pv);
-            }
-        }
-
-        // for volume_id in &self.volumes {
-        //     let state = self.volume_states.get(volume_id).unwrap();
-
-        //     let total_send_volume: f32 = state
-        //         .send_liquid_edges
-        //         .iter()
-        //         .map(|&edge_index| self.liquid_edges.get(edge_index).unwrap().move_volume)
-        //         .sum();
-
-        //     let scale = state.send_max_volume / total_send_volume;
-
-        //     if scale.is_finite() {
-        //         for &edge_index in &state.send_liquid_edges {
-        //             let edge = self.liquid_edges.get_mut(edge_index).unwrap();
-
-        //             edge.limited_move_volume = edge.move_volume * scale;
-        //         }
-        //     }
-
-        //     let total_receive_volume: f32 = state
-        //         .receive_liquid_edges
-        //         .iter()
-        //         .map(|&edge_index| self.liquid_edges.get(edge_index).unwrap().move_volume)
-        //         .sum();
-
-        //     let scale = state.receive_max_volume / total_receive_volume;
-
-        //     if scale.is_finite() {
-        //         for &edge_index in &state.receive_liquid_edges {
-        //             let edge = self.liquid_edges.get_mut(edge_index).unwrap();
-
-        //             edge.limited_move_volume =
-        //                 edge.limited_move_volume.min(edge.move_volume * scale);
-        //         }
-        //     }
-        // }
-
-        // // Extract fluids from mixtures
-
-        // for volume_id in &self.volumes {
-        //     let state = self.volume_states.get(volume_id).unwrap();
-
-        //     let volume = queries
-        //         .get_volume_mut(volume_id)
-        //         .map_err(|err| FlowQueryError(err))?;
-
-        //     for &edge_index in &state.send_liquid_edges {
-        //         let edge = self.liquid_edges.get_mut(edge_index).unwrap();
-
-        //         edge.extracted_mixture =
-        //             volume.mixture.extract_fluids(collection, |_, properties| {
-        //                 if let FluidTypeProperties::Liquid(liquid_properties) =
-        //                     &properties.fluid_type
-        //                 {
-        //                     edge.limited_move_volume / liquid_properties.density
-        //                 } else {
-        //                     0.
-        //                 }
-        //             })?;
-        //     }
-        // }
-
-        // // Insert mixtures
-
-        // for volume_id in &self.volumes {
-        //     let state = self.volume_states.get(volume_id).unwrap();
-
-        //     let volume = queries
-        //         .get_volume_mut(volume_id)
-        //         .map_err(|err| FlowQueryError(err))?;
-
-        //     for &edge_index in &state.receive_liquid_edges {
-        //         let edge = self.liquid_edges.get_mut(edge_index).unwrap();
-
-        //         volume
-        //             .mixture
-        //             .add_mixture(std::mem::take(&mut edge.extracted_mixture));
-        //     }
-        // }
 
         Ok(())
     }

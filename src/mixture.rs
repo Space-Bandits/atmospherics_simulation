@@ -32,6 +32,19 @@ pub struct ComputedMixtureProperties {
 }
 
 impl Mixture {
+    pub fn new(fluids: impl IntoIterator<Item = Fluid>, energy: f32) -> Self {
+        let mut mixture = Mixture {
+            fluids: Vec::new(),
+            energy,
+        };
+
+        for fluid in fluids {
+            mixture.add_fluid(fluid);
+        }
+
+        mixture
+    }
+
     pub fn add_fluid(&mut self, fluid: Fluid) {
         match self
             .fluids
@@ -72,6 +85,23 @@ impl Mixture {
         Ok(mixture)
     }
 
+    pub fn from_fluids_at_temperature(
+        collection: &FluidCollection,
+        fluids: impl IntoIterator<Item = Fluid>,
+        temperature: f32,
+    ) -> Result<Self, InvalidFluidId> {
+        let mut mixture = Mixture {
+            fluids: Vec::new(),
+            energy: 0.,
+        };
+
+        for fluid in fluids {
+            mixture.add_fluid_at_temperature(collection, fluid, temperature)?;
+        }
+
+        Ok(mixture)
+    }
+
     pub fn add_mixture(&mut self, mixture: Self) {
         // Merge the two sorted lists of fluids together, combine duplicate entries.
 
@@ -108,6 +138,8 @@ impl Mixture {
                 break;
             }
         }
+
+        self.energy += mixture.energy;
     }
 
     pub fn add_energy(&mut self, energy: f32) {
@@ -145,7 +177,7 @@ impl Mixture {
             }
         }
 
-        let temperature = heat_capacity * self.energy;
+        let temperature = self.energy / heat_capacity;
 
         Ok(ComputedMixtureProperties {
             heat_capacity,
@@ -196,5 +228,75 @@ impl Mixture {
         self.energy = self.energy * (heat_capacity_kept / heat_capacity);
 
         Ok(mixture)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mixture::{Fluid, Mixture};
+
+    #[test]
+    fn add_mixture_identical_fluid() {
+        let mut mixture = Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 5,
+                moles: 1.,
+            }],
+            energy: 10.,
+        };
+
+        mixture.add_mixture(Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 5,
+                moles: 1.,
+            }],
+            energy: 10.,
+        });
+
+        assert_eq!(mixture.fluids[0].moles, 1. + 1.);
+    }
+
+    #[test]
+    fn add_mixture_lower_fluid() {
+        let mut mixture = Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 5,
+                moles: 1.,
+            }],
+            energy: 10.,
+        };
+
+        mixture.add_mixture(Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 4,
+                moles: 1.,
+            }],
+            energy: 10.,
+        });
+
+        assert_eq!(mixture.fluids[0].fluid_id, 4);
+        assert_eq!(mixture.fluids[1].fluid_id, 5);
+    }
+
+    #[test]
+    fn add_mixture_higher_fluid() {
+        let mut mixture = Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 5,
+                moles: 1.,
+            }],
+            energy: 10.,
+        };
+
+        mixture.add_mixture(Mixture {
+            fluids: vec![Fluid {
+                fluid_id: 6,
+                moles: 1.,
+            }],
+            energy: 10.,
+        });
+
+        assert_eq!(mixture.fluids[0].fluid_id, 5);
+        assert_eq!(mixture.fluids[1].fluid_id, 6);
     }
 }
