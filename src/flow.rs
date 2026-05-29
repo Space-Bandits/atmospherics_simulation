@@ -153,15 +153,6 @@ where
                     - move_gas_work)
                     / (gas_volume + move_liquid_volume);
 
-                println!(
-                    "Moving {} to get pressure {}",
-                    move_ratio, equalized_pressure
-                );
-                println!(
-                    "will move liquid {} and work {}",
-                    move_liquid_volume, move_gas_work
-                );
-
                 let edge_index = self.edges.len();
 
                 self.edges.push(FlowEdgeState {
@@ -217,8 +208,6 @@ where
 
                 if move_ratio.is_finite() {
                     edge.limited_move_ratio = move_ratio;
-
-                    println!("Limiting ratio to {} from recv", move_ratio);
                 } else {
                     edge.limited_move_ratio = 0.;
                 }
@@ -251,8 +240,6 @@ where
 
                 if move_ratio.is_finite() {
                     edge.limited_move_ratio = edge.limited_move_ratio.min(move_ratio);
-
-                    println!("Limiting ratio to {} from send", move_ratio);
                 } else {
                     edge.limited_move_ratio = 0.;
                 }
@@ -271,20 +258,10 @@ where
             for &edge_index in &state.send_edges {
                 let edge = self.edges.get_mut(edge_index).unwrap();
 
-                println!("Extracting {}", edge.move_ratio * edge.limited_move_ratio);
-
                 edge.extracted_mixture =
                     volume.mixture.extract_fluids(collection, |fluid, _| {
                         fluid.moles * edge.move_ratio * edge.limited_move_ratio
                     })?;
-
-                dbg!(
-                    volume
-                        .calculate_properties(collection)
-                        .unwrap()
-                        .mixture_properties
-                        .temperature
-                );
             }
         }
 

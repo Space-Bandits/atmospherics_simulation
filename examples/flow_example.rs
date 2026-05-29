@@ -82,6 +82,7 @@ fn main() {
                 )
                 .unwrap(),
             ),
+            FluidVolume::new_empty(10.),
             FluidVolume::new(
                 10.,
                 Mixture::from_fluid_at_temperature(
@@ -96,7 +97,7 @@ fn main() {
             ),
         ]
         .into(),
-        edges: &[&[1], &[0]],
+        edges: &[&[1], &[0, 2], &[1]],
     };
 
     let mut simulation = FlowSimulationState::default();

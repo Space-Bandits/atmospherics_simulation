@@ -177,7 +177,11 @@ impl Mixture {
             }
         }
 
-        let temperature = self.energy / heat_capacity;
+        let temperature = if heat_capacity == 0. {
+            0.
+        } else {
+            self.energy / heat_capacity
+        };
 
         Ok(ComputedMixtureProperties {
             heat_capacity,
@@ -204,7 +208,11 @@ impl Mixture {
         for fluid in &mut self.fluids {
             let fluid_properties = collection.get_properties(fluid.fluid_id)?;
 
-            let extract_moles = predicate(fluid, fluid_properties).min(fluid.moles);
+            let extract_moles = predicate(fluid, fluid_properties).min(fluid.moles).max(0.);
+
+            heat_capacity_kept +=
+                fluid_properties.molar_heat_capactity * (fluid.moles - extract_moles);
+            heat_capacity_extracted += fluid_properties.molar_heat_capactity * extract_moles;
 
             if extract_moles <= 0. {
                 continue;
@@ -217,15 +225,17 @@ impl Mixture {
                 fluid_id: fluid.fluid_id,
                 moles: extract_moles,
             });
-
-            heat_capacity_kept += fluid_properties.molar_heat_capactity * fluid.moles;
-            heat_capacity_extracted += fluid_properties.molar_heat_capactity * extract_moles;
         }
 
         let heat_capacity = heat_capacity_kept + heat_capacity_extracted;
 
-        mixture.energy = self.energy * (heat_capacity_extracted / heat_capacity);
-        self.energy = self.energy * (heat_capacity_kept / heat_capacity);
+        if heat_capacity == 0. {
+            mixture.energy = 0.;
+            self.energy = 0.;
+        } else {
+            mixture.energy = self.energy * (heat_capacity_extracted / heat_capacity);
+            self.energy = self.energy * (heat_capacity_kept / heat_capacity);
+        }
 
         Ok(mixture)
     }
