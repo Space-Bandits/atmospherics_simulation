@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use atmospherics_simulation::{
     ToKelvin,
-    flow::{FlowSimulationState, SimulationQueries},
+    flow::{EdgeDirectionality, FlowSimulationState, SimulationQueries},
     fluid_properties::{
         FluidCollection, FluidProperties, FluidTypeProperties, GasFluidProperties,
         LiquidFluidProperties,
@@ -26,12 +26,20 @@ static COLLECTION: LazyLock<FluidCollection> = LazyLock::new(|| {
 
 struct SimulationData {
     volumes: Box<[FluidVolume]>,
-    edges: &'static [&'static [usize]],
+    edges: &'static [(usize, usize, EdgeDirectionality)],
 }
 
-impl SimulationQueries<usize, ()> for SimulationData {
-    fn get_edges(&self, node: &usize) -> Result<impl IntoIterator<Item = usize>, ()> {
-        Ok(self.edges[*node].iter().copied())
+impl SimulationQueries<usize, ()> for &mut SimulationData {
+    fn get_edges(
+        &self,
+    ) -> impl IntoIterator<
+        Item = (
+            usize,
+            usize,
+            atmospherics_simulation::flow::EdgeDirectionality,
+        ),
+    > {
+        self.edges.iter().copied()
     }
 
     fn get_volume(&self, volume_id: &usize) -> Result<&FluidVolume, ()> {
@@ -97,7 +105,10 @@ fn main() {
             ),
         ]
         .into(),
-        edges: &[&[1], &[0, 2], &[1]],
+        edges: &[
+            (0, 1, EdgeDirectionality::Bi),
+            (1, 2, EdgeDirectionality::Bi),
+        ],
     };
 
     let mut simulation = FlowSimulationState::default();
